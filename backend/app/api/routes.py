@@ -1,0 +1,290 @@
+"""
+AI Resume ATS — Explainable Resume & Project Intelligence API Routes.
+Endpoints:
+  POST /api/analyze        — Upload resume PDF + JD text, returns Multi-Source Intelligence Report JSON
+  POST /api/verify-project — Verify project claims directly against public GitHub repo
+  GET  /api/sample-data    — Retrieve pre-loaded sample resume & JD for quick demo
+  GET  /api/health         — Health check endpoint
+"""
+import logging
+from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from typing import Optional, List
+
+from app.parser.pdf_parser import extract_text_from_bytes, extract_text_and_links_from_bytes
+from app.parser.resume_parser import parse_resume
+from app.scoring.final_scorer import analyze_resume_intelligence
+from app.evidence.github_analyzer import fetch_github_repo_evidence
+from app.evidence.project_verifier import verify_project_claims
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api")
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint for Docker, Kubernetes, and Jenkins smoke tests."""
+    return {
+        "status": "ok",
+        "service": "AI Resume & Multi-Source Project Intelligence ATS",
+        "version": "2.1.0",
+        "models": ["Sentence-BERT (all-MiniLM-L6-v2)", "GitHub Multi-Repo Discovery", "LinkedIn Career Intelligence", "TF-IDF", "N-Gram"]
+    }
+
+@router.get("/sample-data")
+async def get_sample_data():
+    """Returns sample pre-filled JD and candidate profiles for instant UI demonstration."""
+    sample_jd = """Machine Learning Engineer
+
+We are seeking a skilled Machine Learning Engineer to join our AI team.
+
+Required Skills & Experience:
+• Strong expertise in Python programming
+• Experience building REST APIs with FastAPI or Flask
+• Solid understanding of Machine Learning algorithms, NLP (Natural Language Processing), and Deep Learning
+• Proficiency with SQL and relational databases
+• Familiarity with containerization using Docker and deployment on AWS (Amazon Web Services)
+• Practical knowledge of Git, Linux, PyTorch, and scikit-learn
+• Bachelor's degree in Computer Engineering, Computer Science, or related field
+
+Key Responsibilities:
+• Design, train, and evaluate NLP models and feature extraction algorithms (TF-IDF, Embeddings)
+• Integrate ML models into production REST API microservices
+• Collaborate with software developers and cloud infrastructure teams"""
+
+    return {
+        "sample_jd": sample_jd,
+        "sample_candidate_summary": "Demo ML Engineer JD — upload any candidate resume PDF to analyze against it.",
+    }
+
+@router.post("/parse-resume-preview")
+async def parse_resume_preview(
+    resume_file: UploadFile = File(..., description="Resume PDF file")
+):
+    """
+    Instantly parse uploaded resume PDF and auto-extract candidate name, email, GitHub, LinkedIn, and Portfolio links.
+    """
+    if not resume_file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported. Please upload a valid .pdf resume."
+        )
+
+    try:
+        pdf_bytes = await resume_file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {str(e)}")
+
+    if len(pdf_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded PDF file is empty.")
+
+    try:
+        resume_text, pdf_links = extract_text_and_links_from_bytes(pdf_bytes)
+        parsed = parse_resume(resume_text, additional_links=pdf_links)
+
+        from app.evidence.url_extractor import extract_github_username
+        primary_github = parsed["github_urls"][0] if parsed["github_urls"] else ""
+        github_username = extract_github_username(primary_github) if primary_github else None
+        primary_linkedin = parsed["linkedin_urls"][0] if parsed["linkedin_urls"] else ""
+        primary_portfolio = parsed["portfolio_urls"][0] if parsed["portfolio_urls"] else ""
+
+        return JSONResponse(content={
+            "status": "success",
+            "candidate_name": parsed["candidate_name"],
+            "email": parsed["email"],
+            "phone": parsed["phone"],
+            "github_url": primary_github,
+            "github_username": github_username,
+            "github_urls": parsed["github_urls"],
+            "linkedin_url": primary_linkedin,
+            "linkedin_urls": parsed["linkedin_urls"],
+            "portfolio_url": primary_portfolio,
+            "portfolio_urls": parsed["portfolio_urls"],
+            "skills_count": len(parsed["extracted_skills"]),
+            "extracted_skills": parsed["extracted_skills"][:8],
+            "links_found_count": len(parsed["github_urls"]) + len(parsed["linkedin_urls"]) + len(parsed["portfolio_urls"]),
+            "raw_resume_text": resume_text,
+            "sections": parsed.get("sections", {})
+        })
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to parse resume: {str(e)}")
+
+@router.post("/analyze")
+async def analyze_resume(
+    resume_file: UploadFile = File(..., description="Resume PDF file"),
+    jd_text: str = Form(..., description="Job Description plain text"),
+    github_url: Optional[str] = Form(None, description="Optional explicit GitHub profile or repository URL"),
+    linkedin_url: Optional[str] = Form(None, description="Optional explicit LinkedIn profile URL"),
+    portfolio_url: Optional[str] = Form(None, description="Optional explicit Portfolio URL")
+):
+    """
+    Analyze a resume PDF against a job description and verify public GitHub & LinkedIn evidence.
+    """
+    # 1. Validate file extension
+    if not resume_file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported. Please upload a valid .pdf resume."
+        )
+
+    if not jd_text or not jd_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Job Description text cannot be empty."
+        )
+
+    # 2. Read PDF bytes
+    try:
+        pdf_bytes = await resume_file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {str(e)}")
+
+    if len(pdf_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded PDF file is empty.")
+
+    # 3. Extract text from PDF
+    try:
+        resume_text, pdf_links = extract_text_and_links_from_bytes(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not extract text from PDF: {str(e)}. Ensure the PDF contains selectable text."
+        )
+
+    if not resume_text or not resume_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text found in the uploaded PDF. Ensure the PDF is not image-only or password-protected."
+        )
+
+    override_gh = [github_url.strip()] if github_url and github_url.strip() else []
+    override_li = [linkedin_url.strip()] if linkedin_url and linkedin_url.strip() else []
+    override_pf = [portfolio_url.strip()] if portfolio_url and portfolio_url.strip() else []
+
+    # 4. Run Multi-Source Intelligence Engine
+    try:
+        report = await analyze_resume_intelligence(
+            resume_text=resume_text,
+            jd_text=jd_text.strip(),
+            override_github_urls=override_gh,
+            override_linkedin_urls=override_li,
+            override_portfolio_urls=override_pf,
+            additional_links=pdf_links
+        )
+        report["raw_resume_text"] = resume_text
+        try:
+            from app.parser.canonical_parser import parse_text_to_canonical
+            canonical_obj, clean_md, _ = parse_text_to_canonical(resume_text, additional_links=pdf_links)
+            report["canonical_resume"] = canonical_obj.model_dump()
+            report["markdown_text"] = clean_md
+        except Exception as e:
+            print(f"[Warning] Canonical parse inside analyze: {e}")
+    except Exception as e:
+        logger.exception("[analyze_resume] Intelligence engine error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Intelligence engine error: {str(e)}")
+
+    return JSONResponse(content=report)
+
+@router.post("/quality-check")
+async def run_quality_check(
+    resume_file: Optional[UploadFile] = File(None, description="Resume PDF file"),
+    resume_text_raw: Optional[str] = Form(None, description="Raw resume text or Markdown"),
+    jd_text: Optional[str] = Form(None, description="Optional Job Description for tailoring checks"),
+    target_title: Optional[str] = Form(None, description="Optional target job title for alignment check")
+):
+    """
+    Run the 27-check Resume Quality Engine on the uploaded resume.
+    Returns an overall quality score, grade, and detailed check results.
+    """
+    from app.scoring.quality_engine import run_quality_engine
+    from app.parser.canonical_parser import parse_pdf_bytes_to_canonical, parse_text_to_canonical
+
+    if resume_file:
+        if not resume_file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        pdf_bytes = await resume_file.read()
+        resume_obj, _, _ = parse_pdf_bytes_to_canonical(pdf_bytes)
+        canonical_dict = resume_obj.model_dump()
+    elif resume_text_raw and resume_text_raw.strip():
+        resume_obj, _, _ = parse_text_to_canonical(resume_text_raw.strip())
+        canonical_dict = resume_obj.model_dump()
+    else:
+        raise HTTPException(status_code=400, detail="Provide a resume PDF or resume text.")
+
+    report = run_quality_engine(
+        resume=canonical_dict,
+        jd_text=jd_text.strip() if jd_text else None,
+        target_title=target_title.strip() if target_title else None
+    )
+
+    checks_serialized = [
+        {
+            "id": c.id,
+            "category": c.category,
+            "name": c.name,
+            "status": c.status.value,
+            "explanation": c.explanation,
+            "recommendation": c.recommendation,
+            "score_impact": c.score_impact
+        }
+        for c in report.checks
+    ]
+
+    return JSONResponse(content={
+        "status": "success",
+        "overall_score": report.overall_score,
+        "grade": report.grade,
+        "summary": report.summary,
+        "pass_count": report.pass_count,
+        "warning_count": report.warning_count,
+        "fail_count": report.fail_count,
+        "top_actions": report.top_actions,
+        "checks": checks_serialized
+    })
+
+
+@router.post("/verify-project")
+async def verify_single_project(
+    github_url: str = Form(..., description="GitHub repository URL"),
+    project_title: str = Form(..., description="Project Title"),
+    claimed_technologies: str = Form(..., description="Comma-separated list of claimed technologies")
+):
+    """
+    Directly verify claimed technical skills against a public GitHub repository.
+    """
+    if not github_url or "github.com" not in github_url:
+        raise HTTPException(status_code=400, detail="Valid GitHub URL is required.")
+
+    from app.evidence.url_extractor import parse_github_url
+    parsed = parse_github_url(github_url)
+    if not parsed or parsed.get("type") != "repository":
+        raise HTTPException(status_code=400, detail="Please provide a valid GitHub repository URL (e.g. https://github.com/owner/repo).")
+
+    gh_evidence = await fetch_github_repo_evidence(parsed["owner"], parsed["repo"])
+    
+    tech_list = [t.strip() for t in claimed_technologies.split(",") if t.strip()]
+    claims = [{
+        "claim_type": "Technology / Skill",
+        "claim": tech.title() if len(tech) > 3 else tech.upper(),
+        "source_snippet": f"Claimed technology {tech}",
+        "category": "Skill"
+    } for tech in tech_list]
+
+    project_data = [{
+        "project_title": project_title,
+        "technologies": tech_list,
+        "claims": claims,
+        "urls": [github_url]
+    }]
+
+    verification = verify_project_claims(
+        resume_project_claims=project_data,
+        github_evidence_list=[gh_evidence],
+        portfolio_evidence_list=[]
+    )
+
+    return JSONResponse(content={
+        "project_title": project_title,
+        "github_repository": gh_evidence,
+        "verification": verification
+    })

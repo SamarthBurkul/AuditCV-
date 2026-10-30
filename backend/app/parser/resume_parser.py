@@ -1,0 +1,177 @@
+"""
+Structured Resume Parser module for AI Resume ATS.
+Extracts contact details, GitHub/Portfolio URLs, LinkedIn, and structural resume sections.
+"""
+import re
+from typing import Dict, Any, List, Optional
+from app.utils.skills import extract_skills
+from app.utils.text_utils import extract_all_urls
+
+EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+PHONE_REGEX = r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
+GITHUB_REGEX = r'(?:https?:\/\/)?(?:www\.)?github\.com\/[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_\.-]+)?'
+LINKEDIN_REGEX = r'(?:https?:\/\/)?(?:[a-zA-Z0-9_-]+\.)?linkedin\.com\/(?:in|pub)\/[a-zA-Z0-9_\-\.]+'
+
+SECTION_HEADERS = {
+    "education": [
+        "education", "academic background", "qualification", "qualifications", "academics",
+        "educational background", "academic qualifications",
+    ],
+    "experience": [
+        "experience", "work experience", "employment history", "professional experience",
+        "internships", "internship", "apprenticeship", "apprenticeships", "work history",
+        "industrial training", "professional experience & internships",
+        "professional experience and internships", "work experience & internships",
+    ],
+    "projects": [
+        "projects", "personal projects", "academic projects", "key projects",
+        "technical projects", "major projects", "college projects", "project work",
+    ],
+    "skills": [
+        "skills", "technical skills", "technologies", "core competencies", "skills & tools",
+        "key skills", "technical competencies", "programming skills", "technical skills & tools",
+        "tools & technologies", "skills and technologies",
+    ],
+    "certifications": [
+        "certifications", "certificates", "courses", "licenses",
+        "online certifications", "training & certifications", "training and certifications",
+        "certification", "online courses", "certifications & internships",
+        "certifications and internships", "certification & internships",
+        "certifications & internship",
+    ],
+    "achievements": [
+        "achievements", "achievements and awards", "awards", "honors",
+        "positions of responsibility", "position of responsibility",
+        "achievements & activities", "achievements and activities",
+        "accomplishments",
+    ],
+    "hobbies": [
+        "hobbies", "interests", "hobbies & interests", "personal interests",
+        "extracurricular", "extracurricular activities", "extracurriculars", "co-curricular",
+    ],
+}
+
+def extract_email(text: str) -> str:
+    match = re.search(EMAIL_REGEX, text)
+    return match.group(0) if match else "Not Found"
+
+def extract_phone(text: str) -> str:
+    match = re.search(PHONE_REGEX, text)
+    return match.group(0) if match else "Not Found"
+
+def extract_github_urls(text: str, additional_links: Optional[List[str]] = None) -> List[str]:
+    """Extract all GitHub profile and repository links."""
+    matches = re.findall(GITHUB_REGEX, text, re.IGNORECASE)
+    all_links = list(matches)
+    if additional_links:
+        for link in additional_links:
+            if "github.com" in link.lower():
+                all_links.append(link)
+
+    normalized = []
+    for m in all_links:
+        cleaned = m.strip().rstrip('.,;:)"\'')
+        url = cleaned if cleaned.startswith("http") else f"https://{cleaned}"
+        if url not in normalized:
+            normalized.append(url)
+    return normalized
+
+def extract_linkedin_urls(text: str, additional_links: Optional[List[str]] = None) -> List[str]:
+    """Extract all LinkedIn profile links."""
+    matches = re.findall(LINKEDIN_REGEX, text, re.IGNORECASE)
+    all_links = list(matches)
+    if additional_links:
+        for link in additional_links:
+            if "linkedin.com" in link.lower():
+                all_links.append(link)
+
+    normalized = []
+    for m in all_links:
+        cleaned = m.strip().rstrip('.,;:)"\'')
+        url = cleaned if cleaned.startswith("http") else f"https://{cleaned}"
+        if url not in normalized:
+            normalized.append(url)
+    return normalized
+
+def extract_portfolio_urls(text: str, additional_links: Optional[List[str]] = None) -> List[str]:
+    """Extract personal portfolio / live demo website links (non-github, non-linkedin)."""
+    all_urls = extract_all_urls(text)
+    if additional_links:
+        for link in additional_links:
+            if link not in all_urls:
+                all_urls.append(link)
+
+    portfolios = []
+    for url in all_urls:
+        cleaned = url.strip().rstrip('.,;:)"\'')
+        u_lower = cleaned.lower()
+        if not u_lower.startswith("http"):
+            cleaned = f"https://{cleaned}"
+            u_lower = cleaned.lower()
+        if not any(d in u_lower for d in ["github.com", "linkedin.com", "twitter.com", "facebook.com", "instagram.com", "t.co", "w3.org", "schema.org"]):
+            if cleaned not in portfolios:
+                portfolios.append(cleaned)
+    return portfolios
+
+def extract_candidate_name(text: str) -> str:
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if lines:
+        first_line = lines[0]
+        # Heuristic: Candidate name is often on the first non-empty line if short
+        if len(first_line.split()) <= 4 and not re.search(r'@|http|resume|curriculum|phone|\+?\d', first_line, re.IGNORECASE):
+            return first_line.title()
+    return "Candidate"
+
+def parse_resume_sections(text: str) -> Dict[str, str]:
+    """Segment resume into major sections based on standard section headings."""
+    lines = text.split('\n')
+    sections = {
+        "education": "",
+        "experience": "",
+        "projects": "",
+        "skills": "",
+        "certifications": "",
+        "achievements": "",
+        "hobbies": ""
+    }
+    
+    current_section = None
+    for line in lines:
+        cleaned_line = line.strip().lower()
+        matched_hdr = None
+        for sec_name, keywords in SECTION_HEADERS.items():
+            if any(cleaned_line == kw or cleaned_line.startswith(kw + ":") or cleaned_line.startswith(kw.upper()) for kw in keywords):
+                matched_hdr = sec_name
+                break
+                
+        if matched_hdr:
+            current_section = matched_hdr
+        elif current_section:
+            sections[current_section] += line + "\n"
+            
+    return sections
+
+def parse_resume(raw_text: str, additional_links: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Parse raw resume text into structured components with links, LinkedIn, and sections.
+    """
+    email = extract_email(raw_text)
+    phone = extract_phone(raw_text)
+    name = extract_candidate_name(raw_text)
+    skills = sorted(list(extract_skills(raw_text)))
+    sections = parse_resume_sections(raw_text)
+    github_urls = extract_github_urls(raw_text, additional_links)
+    linkedin_urls = extract_linkedin_urls(raw_text, additional_links)
+    portfolio_urls = extract_portfolio_urls(raw_text, additional_links)
+    
+    return {
+        "candidate_name": name,
+        "email": email,
+        "phone": phone,
+        "extracted_skills": skills,
+        "sections": sections,
+        "github_urls": github_urls,
+        "linkedin_urls": linkedin_urls,
+        "portfolio_urls": portfolio_urls,
+        "raw_text": raw_text
+    }

@@ -1,0 +1,165 @@
+"""
+GitHub OAuth & Token Authorization Service.
+Handles GitHub OAuth URL generation, state validation, authorization code exchange,
+and in-memory token cache for authenticated identity verification.
+"""
+import os
+import secrets
+import httpx
+from typing import Optional, Dict, Tuple, Any
+
+# Environment variables for GitHub OAuth
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
+GITHUB_REDIRECT_URI = os.getenv("GITHUB_REDIRECT_URI", "http://localhost:8000/api/github/callback")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+# In-memory storage for active OAuth states and authenticated user tokens
+# state -> {"resume_username": str, "created_at": float}
+OAUTH_STATES: Dict[str, Dict[str, Any]] = {}
+
+# Active authenticated session token cache
+# login -> access_token
+USER_TOKENS: Dict[str, str] = {}
+# Global active authenticated session for single-user local ATS
+CURRENT_SESSION: Dict[str, Any] = {
+    "access_token": GITHUB_TOKEN if GITHUB_TOKEN else None,
+    "login": None,
+    "github_user_id": None,
+    "avatar_url": None,
+    "verified_at": None,
+    "resume_username": None
+}
+
+def generate_oauth_url(resume_username: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Generate the GitHub OAuth authorization URL with CSRF state token.
+    Scope includes `read:user` and `repo` (to read public/private contributions).
+    """
+    state = secrets.token_urlsafe(24)
+    OAUTH_STATES[state] = {
+        "resume_username": resume_username.strip() if resume_username else None
+    }
+
+    client_id = GITHUB_CLIENT_ID
+    redirect_uri = GITHUB_REDIRECT_URI
+    scope = "read:user repo"
+
+    auth_url = (
+        f"https://github.com/login/oauth/authorize"
+        f"?client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&scope={scope}"
+        f"&state={state}"
+    )
+    return auth_url, state
+
+def validate_oauth_state(state: str) -> Optional[Dict[str, Any]]:
+    """Validate and consume OAuth state token."""
+    return OAUTH_STATES.pop(state, None)
+
+async def exchange_code_for_token(code: str) -> Optional[str]:
+    """
+    Exchange authorization code for a GitHub access token.
+    Uses POST https://github.com/login/oauth/access_token.
+    """
+    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+        return None
+
+    url = "https://github.com/login/oauth/access_token"
+    headers = {"Accept": "application/json"}
+    payload = {
+        "client_id": GITHUB_CLIENT_ID,
+        "client_secret": GITHUB_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": GITHUB_REDIRECT_URI
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("access_token")
+    except Exception as e:
+        print(f"[GitHub OAuth Error]: Failed to exchange code: {e}")
+
+    return None
+
+def _save_token_to_env(token: str):
+    """Persist GITHUB_TOKEN to backend/.env preserving other configuration."""
+    try:
+        backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        env_path = os.path.join(backend_dir, ".env")
+        lines = []
+        if os.path.isfile(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        new_lines = []
+        replaced = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("GITHUB_TOKEN=") and not stripped.startswith("#"):
+                new_lines.append(f"GITHUB_TOKEN={token}\n")
+                replaced = True
+            else:
+                new_lines.append(line)
+        if not replaced:
+            new_lines.append(f"\nGITHUB_TOKEN={token}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except Exception as e:
+        print(f"[oauth_service]: Failed to persist GITHUB_TOKEN to .env: {e}")
+
+def set_current_session(token: str, login: str, github_user_id: int, avatar_url: Optional[str], resume_username: Optional[str], verified_at: str):
+    """Set the currently active authenticated session in runtime memory."""
+    global GITHUB_TOKEN
+    GITHUB_TOKEN = token
+    os.environ["GITHUB_TOKEN"] = token
+    CURRENT_SESSION["access_token"] = token
+    CURRENT_SESSION["login"] = login
+    CURRENT_SESSION["github_user_id"] = github_user_id
+    CURRENT_SESSION["avatar_url"] = avatar_url
+    CURRENT_SESSION["resume_username"] = resume_username
+    CURRENT_SESSION["verified_at"] = verified_at
+    if login:
+        USER_TOKENS[login.lower()] = token
+
+def get_current_token() -> Optional[str]:
+    """Get active access token from current session or environment."""
+    global GITHUB_TOKEN
+    token = CURRENT_SESSION.get("access_token") or os.getenv("GITHUB_TOKEN") or GITHUB_TOKEN
+    if not token:
+        try:
+            from dotenv import load_dotenv
+            _backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            _env_path = os.path.join(_backend_dir, ".env")
+            if os.path.isfile(_env_path):
+                load_dotenv(_env_path, override=True)
+                token = os.getenv("GITHUB_TOKEN")
+                if token:
+                    CURRENT_SESSION["access_token"] = token
+                    GITHUB_TOKEN = token
+        except Exception:
+            pass
+    return token or None
+
+def get_current_session() -> Dict[str, Any]:
+    """Retrieve the current authenticated session details."""
+    # Ensure access_token is synchronized with environment if not set
+    if not CURRENT_SESSION.get("access_token"):
+        tok = get_current_token()
+        if tok:
+            CURRENT_SESSION["access_token"] = tok
+    return CURRENT_SESSION.copy()
+
+def clear_current_session():
+    """Clear active session and disconnect."""
+    active_tok = os.getenv("GITHUB_TOKEN") or GITHUB_TOKEN or None
+    CURRENT_SESSION["access_token"] = active_tok
+    CURRENT_SESSION["login"] = None
+    CURRENT_SESSION["github_user_id"] = None
+    CURRENT_SESSION["avatar_url"] = None
+    CURRENT_SESSION["verified_at"] = None
+    CURRENT_SESSION["resume_username"] = None
+
